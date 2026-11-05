@@ -1,7 +1,7 @@
 # sanubari-core
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Architecture](https://img.shields.io/badge/Architecture-MultiROI%20Fusion-5B5BD6)](#system-architecture)
 [![Build](https://img.shields.io/badge/Build-Research%20Prototype-orange)](#validation-and-tests)
 
