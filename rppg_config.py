@@ -59,6 +59,10 @@ class RPPGConfig:
     EXPOSURE_DRIFT_SQI_PENALTY: float = 0.35
     EXPOSURE_DRIFT_WEIGHT_MULT: float = 0.45
 
+    # SNR_KILL_THRESHOLD is in dB, NOT percent.
+    # roi.roi_snr is stored in dB (from PosteriorSQI.snr_db).
+    # At 20 dB: normalized SNR score = ((20+20)/60)^1.5 ≈ 0.544.
+    # The 20 dB boundary is the standard "good vs noise-floor" physiological SNR.
     SNR_KILL_THRESHOLD: float = 20.0
     SNR_KILL_WEIGHT: float = 0.08
 

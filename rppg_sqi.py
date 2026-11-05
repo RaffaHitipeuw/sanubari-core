@@ -1,11 +1,10 @@
 
-
-
 import numpy as np
 from scipy.signal import welch, find_peaks
 from scipy.stats import entropy as scipy_entropy
 from dataclasses import dataclass
 from typing import Tuple, Optional
+
 from collections import deque
 
 
@@ -170,11 +169,8 @@ class PosteriorSQI:
 
         p_valid = float(1.0 / (1.0 + np.exp(-log_post)))
         if prev_sqi >= 0:
-            # Only blend with history when the current estimate is not severely penalized.
-            # If log_bio is very negative (harmonic/BPM prior fired hard), bypass blending
-            # so the zombie can't maintain SQI through historical momentum.
             if log_bio < -4.0:
-                pass   # No blending — hard penalty lands immediately
+                pass
             else:
                 p_valid = 0.35 * p_valid + 0.65 * (prev_sqi / 100.0)
 

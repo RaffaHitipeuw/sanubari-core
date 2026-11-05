@@ -419,10 +419,58 @@ def main(enable_logging=False):
 
         fr = fusion_engine.update(frame, face_landmarks, H, W)
 
+        # ── Phase 8.4E: hoist diagnostics so they're always in scope ───────────
+        # Extract motion + landmark diagnostics BEFORE the rejection block so they are
+        # available to the [ROI DEBUG] print even when motion is NOT rejected.
+        # These are frame-level reads — no state is modified.
+        grace_rem = fusion_engine.motion_detector.grace_remaining
+        det_is_mov = fusion_engine.motion_detector.is_moving
+        if grace_rem > 0:
+            motion_tag = "grace"
+        elif det_is_mov:
+            motion_tag = "active"
+        else:
+            motion_tag = "inactive"
+        det_grace   = getattr(fr, '_diag_grace_counter',      None)
+        det_score   = getattr(fr, '_diag_score_at_decision',  None)
+        det_ema     = getattr(fr, '_diag_score_ema',          None)
+        overr_fired = getattr(fr, '_diag_override_fired',     None)
+        was_stale   = getattr(fr, '_diag_was_local_stale',    None)
+        lm_valid    = getattr(fr, '_diag_landmarks_valid',    None)
+        lm_since    = getattr(fr, '_diag_frames_since_mp',    None)
+        lm_cached   = getattr(fr, '_diag_landmarks_cached',  None)
+
+        # ── Phase 8.4E: graceful None handling for EMA field ─────────────────────
+        # det_ema may be None (early-return path; detector not executed so no EMA).
+        # "n/a" distinguishes missing input from a valid zero score.
+        _ema_str = f"{det_ema:.2f}" if det_ema is not None else "n/a"
         if fr.motion_rejected:
-            vitals_engine.failure_log.log("motion_rejected", f"score={fr.motion_score:.2f}", fr.motion_score)
+            detail = (
+                f"score={fr.motion_score:.2f} ema={_ema_str} grace={grace_rem}({motion_tag})"
+                f" det_isMov={det_is_mov} det_grace={det_grace} det_score={det_score:.2f}"
+                f" overr_stale={overr_fired} was_stale={was_stale}"
+                f" lm={lm_valid} sinceMp={lm_since} cached={lm_cached}"
+            )
+            vitals_engine.failure_log.log("motion_rejected", detail, fr.motion_score)
         if fr.exposure_drift > 35:
             vitals_engine.failure_log.log("exposure_drift", f"drift={fr.exposure_drift:.1f}", fr.exposure_drift)
+
+        # ── Phase 8.6 Fix 2: sqi_gated counter ──────────────────────────────────
+        # sqi_gated was defined in FailureModeLogger.counts but never incremented.
+        # Increment when fused SQI falls below the hard gate threshold.
+        if fr.fused_sqi < SQI_HARD_GATE:
+            vitals_engine.failure_log.log("sqi_gated", f"fused_sqi={fr.fused_sqi:.1f}% < {SQI_HARD_GATE}%", fr.fused_sqi)
+
+        # ── Phase 8.6 Fix 2: low_snr counter ──────────────────────────────────
+        # low_snr was defined in FailureModeLogger.counts but never incremented.
+        # Increment when the best ROI's SNR (dB) falls below SNR_KILL_THRESHOLD (20 dB).
+        # roi.roi_snr is in dB (PosteriorSQI.snr_db). SNR_KILL_THRESHOLD is in dB.
+        _best_roi_snr = 0.0
+        for _roi_name, _roi_obj in fr.roi_signals.items():
+            if hasattr(_roi_obj, 'roi_snr') and _roi_obj.roi_snr > _best_roi_snr:
+                _best_roi_snr = float(_roi_obj.roi_snr)
+        if _best_roi_snr > 0 and _best_roi_snr < cfg.SNR_KILL_THRESHOLD:
+            vitals_engine.failure_log.log("low_snr", f"best_roi_snr={_best_roi_snr:.1f} < {cfg.SNR_KILL_THRESHOLD}", _best_roi_snr)
 
         mean_brightness = fr.frame_brightness
 
@@ -432,7 +480,15 @@ def main(enable_logging=False):
             holdover_age = now - last_valid_bpm_ts
             display_bpm = last_valid_bpm if (last_valid_bpm > 0 and holdover_age <= BPM_HOLDOVER_SEC) else display_bpm
         elif _motion_clear_frame < 0:
-
+            # ── Phase 8.4E: log transition out of REJECT for forensic reconstruction ──
+            # The event buffer only records rejected frames; this entry event marks the
+            # REJECT→OK boundary so the full transition sequence can be reconstructed.
+            vitals_engine.failure_log.log(
+                "motion_cleared",
+                f"grace_rem={grace_rem} det_isMov={det_is_mov} "
+                f"det_grace={det_grace} ema={_ema_str} lm={lm_valid}",
+                0.0
+            )
             _motion_clear_frame = frame_count
             display_bpm = last_valid_bpm if last_valid_bpm > 0 else display_bpm
         elif frame_count - _motion_clear_frame < _cfg.MOTION_GRACE_FRAMES:
@@ -490,13 +546,21 @@ def main(enable_logging=False):
                 ai_result = ai_layer.interpret(v_dict, baseline_dev, trend)
                 last_ai_check = now
 
-        if frame_count % 90 == 0 and fr.fused_bpm > 0:
+        # ── Phase 8.4E: emit [ROI DEBUG] every 30 frames (1 s at 30 FPS) ─────────
+        # Previously fired only every 90 frames (3 s), leaving long opaque windows.
+        # Fires whenever motion is rejected OR a valid BPM is available.
+        if frame_count % 30 == 0 and (fr.motion_rejected or fr.fused_bpm > 0):
             bd = fr.sqi_breakdown
-            print(f"\n[ROI DEBUG] frame={frame_count}  fused_BPM={fr.fused_bpm:.1f}"
-                  f"fused_SQI={fr.fused_sqi:.1f}%  "
-                  f"session_conf={fr.session_confidence:.1f}%  "
-                  f"motion={'REJECT' if fr.motion_rejected else 'ok'}  "
-                  f"exposure_drift={fr.exposure_drift:.1f}")
+            if fr.motion_rejected:
+                print(f"\n[ROI DEBUG] frame={frame_count}  motion={'REJECT' if fr.motion_rejected else 'ok'}"
+                      f"  score={fr.motion_score:.2f}  ema={_ema_str}  grace={grace_rem}({motion_tag})"
+                      f"  det_isMov={det_is_mov}  det_grace={det_grace}  det_score={det_score:.2f}"
+                      f"  overr_stale={overr_fired}  was_stale={was_stale}"
+                      f"  lm={lm_valid}  sinceMp={lm_since}  cached={lm_cached}")
+            else:
+                print(f"\n[ROI DEBUG] frame={frame_count}  fused_BPM={fr.fused_bpm:.1f}"
+                      f"  fused_SQI={fr.fused_sqi:.1f}%  session_conf={fr.session_confidence:.1f}%  "
+                      f"motion={'REJECT' if fr.motion_rejected else 'ok'}  exposure_drift={fr.exposure_drift:.1f}")
             for rname, roi in fr.roi_signals.items():
                 if roi.valid:
                     skin_cov = getattr(roi, 'skin_coverage', 1.0)
@@ -504,7 +568,7 @@ def main(enable_logging=False):
                     print(f"  {rname:12s}  BPM={roi.bpm:6.1f}  SQI={roi.sqi:5.1f}%  "
                           f"dyn_w={roi.dynamic_weight:6.3f}  agree={agree_f:.2f}  "
                           f"bright={roi.roi_brightness:5.1f}  "
-                          f"snr={roi.roi_snr:5.1f}  reg={roi.roi_regularity:5.1f}  "
+                          f"snr={roi.roi_snr:.2f}dB  reg={roi.roi_regularity:.1f}%  "
                           f"skin_cov={skin_cov:.2f}")
             print(f"  SQI breakdown: SNR={bd.get('snr',0):.1f}%  "
                   f"reg={bd.get('regularity',0):.1f}%  var={bd.get('variance',0):.1f}%  "
@@ -771,7 +835,10 @@ def main(enable_logging=False):
         elif key == ord('f'):
             summary = vitals_engine.failure_log.get_summary()
             print(f"\n[FAILURE MODES] {summary}")
-            recent = vitals_engine.failure_log.recent_events(10)
+            # Buffer holds 500 events; show last 50 for transition analysis.
+            # Each line: timestamp  type  detail (score, ema, grace, lm_valid, sinceMp, cached...)
+            recent = vitals_engine.failure_log.recent_events(50)
+            print(f"[EVENTS] last {len(recent)} of 500 buffered events:")
             for ev in recent:
                 ts_str = time.strftime("%H:%M:%S", time.localtime(ev["ts"]))
                 print(f"  {ts_str}  {ev['type']:25s}  {ev['detail']}")
